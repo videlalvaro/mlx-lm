@@ -45,6 +45,7 @@ setup(
         "test": ["datasets", "lm-eval"],
         "train": ["datasets", "tqdm"],
         "evaluate": ["lm-eval", "tqdm"],
+        "aion": ["onnx"],
         "cuda13": [f"mlx[cuda13]>={MIN_MLX_VERSION}"],
         "cuda12": [f"mlx[cuda12]>={MIN_MLX_VERSION}"],
         "cpu": [f"mlx[cpu]>={MIN_MLX_VERSION}"],
@@ -53,6 +54,7 @@ setup(
         "console_scripts": [
             "mlx_lm = mlx_lm.cli:main",
             "mlx_lm.awq = mlx_lm.quant.awq:main",
+            "mlx_lm.aion_onnx_convert = mlx_lm.aion_onnx_convert:main",
             "mlx_lm.dwq = mlx_lm.quant.dwq:main",
             "mlx_lm.dynamic_quant = mlx_lm.quant.dynamic_quant:main",
             "mlx_lm.gptq = mlx_lm.quant.gptq:main",

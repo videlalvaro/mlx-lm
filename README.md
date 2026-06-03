@@ -1,3 +1,55 @@
+## Experimental Aion Edge ONNX support
+
+**Standard benchmark (`-p 2048 -g 128 -n 3`): prompt_tps=2837.910, generation_tps=184.809, peak_memory=3.458 GB**
+
+**Short smoke (`-p 64 -g 16 -n 1`): prompt_tps=1814.535, generation_tps=211.037, peak_memory=2.670 GB**
+
+Tested on a MacBook Pro (Mac16,6), Apple M4 Max, 16-core CPU, 48 GB memory,
+macOS 26.5.1.
+
+This fork contains experimental MLX-LM support for converting a local
+Aion-1.0-Instruct Edge ONNX bundle into MLX safetensors and running it through
+the normal MLX-LM loader and benchmark path.
+
+Microsoft announced the Aion-1.0-Instruct developer preview for Edge Canary and
+Dev here:
+
+https://blogs.windows.com/msedgedev/2026/06/02/expanding-on-device-ai-in-microsoft-edge-new-models-and-apis-for-the-web/
+
+To get access to the model today, install Microsoft Edge Canary or Dev and use
+the Aion Prompt API docs/playground path from the announcement so Edge downloads
+the local ONNX/external-data bundle. Then convert that local bundle from this
+MLX-LM checkout. The bundle directory should contain files such as `model.onnx`,
+`model.onnx.data`, `genai_config.json`, and `tokenizer.json`.
+
+```bash
+python -m mlx_lm.aion_onnx_convert \
+    --bundle /path/to/aion-onnx-bundle \
+    --out-dir /tmp/aion-mlx-model \
+    --max-seq-len 4096
+```
+
+Benchmark with MLX-LM as usual:
+
+```bash
+python -m mlx_lm.benchmark --model /tmp/aion-mlx-model -p 2048 -g 128 -n 3
+```
+
+The short smoke result above used `-p 64 -g 16 -n 1`.
+
+Correctness is checked against an exact-reference ONNX session where
+`MatMulNBits` uses `accuracy_level=1`:
+
+```bash
+python -m unittest tests.test_aion_onnx_convert
+AION_ONNX_BUNDLE=/path/to/aion-onnx-bundle \
+    python -m unittest tests.test_aion_onnx_correctness
+```
+
+The converter reads a local bundle supplied by the user. This branch does not
+include model weights, tokenizer files, generated safetensors, or any Aion model
+data.
+
 ## MLX LM 
 
 MLX LM is a Python package for generating text and fine-tuning large language

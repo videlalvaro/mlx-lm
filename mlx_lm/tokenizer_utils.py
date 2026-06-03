@@ -6,6 +6,7 @@ from json import JSONDecodeError
 from typing import Any, Dict, List, Optional
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
 
 class StreamingDetokenizer:
@@ -610,10 +611,18 @@ def load(
 
     tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
+    tokenizer_config_data = {}
+    if tokenizer_config_file.exists():
+        tokenizer_config_data = json.loads(tokenizer_config_file.read_text(encoding="utf-8"))
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, **(tokenizer_config_extra or {})
-    )
+    if tokenizer_config_data.get("tokenizer_class") == "TokenizersBackend":
+        tokenizer = TokenizersBackend.from_pretrained(
+            model_path, **(tokenizer_config_extra or {})
+        )
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, **(tokenizer_config_extra or {})
+        )
 
     tokenizer_config = tokenizer.init_kwargs
 

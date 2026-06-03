@@ -14,6 +14,50 @@ The command for efficiency benchmarks:
 mlx_lm.benchmark --model model/repo -p 2048 -g 128
 ```
 
+Experimental Aion Edge ONNX support converts a local ONNX/external-data bundle
+to an MLX-LM safetensors directory. The converter does not ship or download the
+model; it only reads a bundle already present on the local machine.
+
+```
+mlx_lm.aion_onnx_convert \
+  --bundle /path/to/aion-onnx-bundle \
+  --out-dir /tmp/aion-mlx-model \
+  --max-seq-len 4096
+```
+
+Then benchmark it with the normal MLX-LM benchmark command:
+
+```
+python -m mlx_lm.benchmark --model /tmp/aion-mlx-model -p 64 -g 16 -n 1
+```
+
+Current short smoke result on Apple GPU:
+
+```
+prompt_tps=1814.535, generation_tps=211.037, peak_memory=2.670 GB
+```
+
+Current standard benchmark result with `-p 2048 -g 128 -n 3`:
+
+```
+Averages: prompt_tps=2837.910, generation_tps=184.809, peak_memory=3.458
+```
+
+Exported safetensors parity should be checked against an exact-reference ONNX
+session with `MatMulNBits` `accuracy_level=1`. The stock Edge ONNX graph may use
+a different ONNX Runtime kernel accuracy policy, which is useful as a runtime
+behavior check but not as the exact model-math reference.
+
+One exact-reference smoke result for `"Hello, who are you?"`:
+
+```
+mlx_argmax=357, onnx_argmax=357, cosine=0.998563
+```
+
+The exporter preserves Aion's mixed quantization: transformer projections are
+4-bit affine MLX quantized weights, while `lm_head` is exported with an 8-bit
+per-module quantization override.
+
 To get the package versions run:
 
 ```
