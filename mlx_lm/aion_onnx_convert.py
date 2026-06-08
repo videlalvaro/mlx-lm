@@ -109,7 +109,7 @@ class OnnxWeightStore:
         return None
 
 
-def pack_aion_quantized(packed: np.ndarray, scales: np.ndarray, spec: QuantSpec) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def pack_aion_quantized(packed: np.ndarray, scales: np.ndarray, spec: QuantSpec) -> tuple[np.ndarray, np.ndarray]:
     if spec.bits not in (4, 8):
         raise ValueError(f"unsupported bit width for MLX export: {spec.bits}")
     if spec.bits == 4:
@@ -126,19 +126,16 @@ def pack_aion_quantized(packed: np.ndarray, scales: np.ndarray, spec: QuantSpec)
         q32 |= (q[:, word_offset::values_per_word] & mask) << (spec.bits * word_offset)
 
     scale = scales.reshape(spec.n, spec.k // spec.block_size).astype(np.float16)
-    zero_point = 1 << (spec.bits - 1)
-    bias = (-float(zero_point) * scale.astype(np.float32)).astype(np.float16)
-    return q32, scale, bias
+    return q32, scale
 
 
 def add_linear(weights: dict[str, mx.array], store: OnnxWeightStore, out_name: str, source_names: list[str]) -> tuple[int | None, int | None]:
     quantized = store.get_quantized_any(source_names)
     if quantized is not None:
         packed, scales, spec = quantized
-        qweight, qscales, qbiases = pack_aion_quantized(packed, scales, spec)
+        qweight, qscales = pack_aion_quantized(packed, scales, spec)
         weights[f"{out_name}.weight"] = mx.array(qweight)
         weights[f"{out_name}.scales"] = mx.array(qscales)
-        weights[f"{out_name}.biases"] = mx.array(qbiases)
         return spec.bits, spec.block_size
     weights[f"{out_name}.weight"] = mx.array(store.get_any(source_names).astype(np.float16))
     return None, None
@@ -199,14 +196,20 @@ def convert(bundle: Path, out_dir: Path, max_seq_len: int | None = None) -> dict
     weights: dict[str, mx.array] = {}
     linear_quantization: dict[str, tuple[int, int]] = {}
 
-    embed = store.get_any(["lm_head.weight_quantized", "model.embed_tokens.weight"]).astype(np.float16)
-    weights["model.embed_tokens.weight"] = mx.array(embed)
-    bits, group_size = add_linear(weights, store, "lm_head", ["lm_head.weight_quantized", "lm_head.weight"])
+    # Store embed_tokens as quantized and tie with lm_head (no separate lm_head stored).
+    # The ONNX model ties embed_tokens and lm_head as a single quantized tensor.
+    bits, group_size = add_linear(weights, store, "model.embed_tokens", ["lm_head.weight_quantized", "lm_head.weight", "model.embed_tokens.weight"])
     if bits is not None and group_size is not None:
-        linear_quantization["lm_head"] = (bits, group_size)
+        linear_quantization["model.embed_tokens"] = (bits, group_size)
     add_norm(weights, store, "model.norm", ["model.norm.weight", "transformer.ln_f.weight"])
 
     intermediate_size = None
+    # Store cos/sin cache once at model level (shared across all layers).
+    cos_cache = store.get_any(["model.layers.0.self_attn.cos_cached_export", "layers.0.self_attn.cos_cached_export"])
+    sin_cache = store.get_any(["model.layers.0.self_attn.sin_cached_export", "layers.0.self_attn.sin_cached_export"])
+    weights["model.cos_cache"] = mx.array(cos_cache[:context_length].astype(np.float16))
+    weights["model.sin_cache"] = mx.array(sin_cache[:context_length].astype(np.float16))
+
     for layer_idx in range(num_layers):
         source_prefix = f"model.layers.{layer_idx}."
         target_prefix = f"model.layers.{layer_idx}."
@@ -234,14 +237,6 @@ def convert(bundle: Path, out_dir: Path, max_seq_len: int | None = None) -> dict
                 linear_quantization[target_prefix + "mlp." + proj] = (bits, group_size)
         if intermediate_size is None:
             intermediate_size = weights[target_prefix + "mlp.gate_proj.weight"].shape[0]
-        try:
-            cos_cache = store.get_any([source_prefix + "self_attn.cos_cached_export", f"layers.{layer_idx}.self_attn.cos_cached_export"])
-            sin_cache = store.get_any([source_prefix + "self_attn.sin_cached_export", f"layers.{layer_idx}.self_attn.sin_cached_export"])
-        except KeyError:
-            cos_cache = store.get_any(["model.layers.0.self_attn.cos_cached_export", "layers.0.self_attn.cos_cached_export"])
-            sin_cache = store.get_any(["model.layers.0.self_attn.sin_cached_export", "layers.0.self_attn.sin_cached_export"])
-        weights[target_prefix + "self_attn.cos_cache"] = mx.array(cos_cache[:context_length].astype(np.float16))
-        weights[target_prefix + "self_attn.sin_cache"] = mx.array(sin_cache[:context_length].astype(np.float16))
 
     quantization = build_quantization_config(linear_quantization)
 
@@ -256,6 +251,7 @@ def convert(bundle: Path, out_dir: Path, max_seq_len: int | None = None) -> dict
         "vocab_size": vocab_size,
         "max_position_embeddings": context_length,
         "rms_norm_eps": 1e-5,
+        "tie_word_embeddings": True,
         "eos_token_id": model_cfg.get("eos_token_id", []),
         "quantization": quantization,
     }
