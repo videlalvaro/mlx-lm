@@ -39,12 +39,20 @@ class OnnxWeightStore:
                 continue
             attrs = {attr.name: onnx.helper.get_attribute_value(attr) for attr in node.attribute}
             if {"bits", "block_size", "K", "N"}.issubset(attrs):
-                self.quant_specs[node.input[1]] = QuantSpec(
+                spec = QuantSpec(
                     bits=int(attrs["bits"]),
                     block_size=int(attrs["block_size"]),
                     k=int(attrs["K"]),
                     n=int(attrs["N"]),
                 )
+                self.quant_specs[node.input[1]] = spec
+                # MatMulNBits zero-points are optional input index 3. This converter
+                # assumes symmetric quantization (zero-point = 2^(bits-1)); validate any
+                # explicit zero-points so asymmetric ones are never silently dropped.
+                if len(node.input) > 3 and node.input[3]:
+                    zero_points = self.weights.get(node.input[3])
+                    if zero_points is not None:
+                        self._validate_symmetric_zero_points(zero_points, spec)
 
     @staticmethod
     def _expand(candidate: str) -> list[str]:
@@ -53,6 +61,30 @@ class OnnxWeightStore:
             names.append(candidate.replace(".weight", ".matmul.backbone.weight_quantized"))
             names.append(candidate.replace(".weight", ".weight_quantized"))
         return names
+
+    @staticmethod
+    def _validate_symmetric_zero_points(zero_points: np.ndarray, spec: QuantSpec) -> None:
+        # The converter dequantizes with a fixed symmetric zero-point of 2^(bits-1).
+        # If the ONNX graph carries explicit zero-points that differ, the exported
+        # weights would be shifted, so fail loudly instead of corrupting them silently.
+        default = 1 << (spec.bits - 1)
+        n_blocks = spec.k // spec.block_size
+        zp = np.asarray(zero_points)
+        if zp.dtype == np.uint8 and spec.bits == 4:
+            packed = zp.reshape(spec.n, -1)
+            nibbles = np.empty((packed.shape[0], packed.shape[1] * 2), dtype=np.int32)
+            nibbles[:, 0::2] = packed & 0x0F
+            nibbles[:, 1::2] = (packed >> 4) & 0x0F
+            values = nibbles[:, :n_blocks]
+        else:
+            values = zp.reshape(spec.n, -1)[:, :n_blocks]
+        if not np.all(values == default):
+            raise ValueError(
+                f"MatMulNBits weight carries non-symmetric zero-points (expected all "
+                f"{default} for {spec.bits}-bit affine quantization). The Aion MLX "
+                "converter only supports symmetric quantization; asymmetric zero-points "
+                "would be dropped and corrupt the exported weights."
+            )
 
     @staticmethod
     def _dequantize_blockwise(packed: np.ndarray, scales: np.ndarray, spec: QuantSpec) -> np.ndarray:
@@ -178,6 +210,29 @@ def build_quantization_config(linear_quantization: dict[str, tuple[int, int]]) -
     return quantization
 
 
+def assert_uniform_rope_cache(store: OnnxWeightStore, num_layers: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return layer 0's RoPE cos/sin cache after verifying every layer's cache matches.
+
+    The MLX export stores a single model-level RoPE cache shared by all layers, so a
+    bundle whose per-layer caches differ would change behavior once collapsed.
+    """
+    ref_cos = store.get_any(["model.layers.0.self_attn.cos_cached_export", "layers.0.self_attn.cos_cached_export"])
+    ref_sin = store.get_any(["model.layers.0.self_attn.sin_cached_export", "layers.0.self_attn.sin_cached_export"])
+    for layer_idx in range(num_layers):
+        try:
+            cos = store.get_any([f"model.layers.{layer_idx}.self_attn.cos_cached_export", f"layers.{layer_idx}.self_attn.cos_cached_export"])
+            sin = store.get_any([f"model.layers.{layer_idx}.self_attn.sin_cached_export", f"layers.{layer_idx}.self_attn.sin_cached_export"])
+        except KeyError:
+            continue
+        if not np.array_equal(cos, ref_cos) or not np.array_equal(sin, ref_sin):
+            raise ValueError(
+                f"layer {layer_idx} RoPE cos/sin cache differs from layer 0; the MLX "
+                "export shares a single model-level RoPE cache and cannot represent "
+                "per-layer RoPE without changing model behavior."
+            )
+    return ref_cos, ref_sin
+
+
 def convert(bundle: Path, out_dir: Path, max_seq_len: int | None = None) -> dict:
     bundle = Path(bundle)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -204,9 +259,9 @@ def convert(bundle: Path, out_dir: Path, max_seq_len: int | None = None) -> dict
     add_norm(weights, store, "model.norm", ["model.norm.weight", "transformer.ln_f.weight"])
 
     intermediate_size = None
-    # Store cos/sin cache once at model level (shared across all layers).
-    cos_cache = store.get_any(["model.layers.0.self_attn.cos_cached_export", "layers.0.self_attn.cos_cached_export"])
-    sin_cache = store.get_any(["model.layers.0.self_attn.sin_cached_export", "layers.0.self_attn.sin_cached_export"])
+    # Store cos/sin cache once at model level (shared across all layers). The MLX model
+    # uses a single RoPE cache, so require every layer's cache to be identical first.
+    cos_cache, sin_cache = assert_uniform_rope_cache(store, num_layers)
     weights["model.cos_cache"] = mx.array(cos_cache[:context_length].astype(np.float16))
     weights["model.sin_cache"] = mx.array(sin_cache[:context_length].astype(np.float16))
 

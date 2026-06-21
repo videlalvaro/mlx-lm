@@ -4,16 +4,32 @@ import unittest
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 
 from mlx_lm.aion_onnx_convert import (
+    OnnxWeightStore,
     QuantSpec,
+    assert_uniform_rope_cache,
     build_quantization_config,
     copy_tokenizer_files,
     pack_aion_quantized,
 )
 from mlx_lm.chat_templates.aion import apply_chat_template
 from mlx_lm.models.aion_onnx_mlx import Model, ModelArgs
+
+
+class _DictStore:
+    """Minimal OnnxWeightStore stand-in exposing get_any for RoPE-uniformity tests."""
+
+    def __init__(self, tensors):
+        self._tensors = tensors
+
+    def get_any(self, names):
+        for name in names:
+            if name in self._tensors:
+                return self._tensors[name]
+        raise KeyError(names)
 
 
 class TestAionOnnxConvert(unittest.TestCase):
@@ -183,6 +199,63 @@ class TestAionOnnxConvert(unittest.TestCase):
         np.testing.assert_array_equal(
             np.array(sanitized["model.layers.0.self_attn.q_proj.biases"]),
             np.array(existing_biases),
+        )
+
+    def test_validate_symmetric_zero_points_accepts_default_4bit(self):
+        spec = QuantSpec(bits=4, block_size=4, k=8, n=2)
+        # Two 4-bit blocks per row, both at the symmetric default of 8, pack into 0x88.
+        zero_points = np.full((spec.n, 1), 0x88, dtype=np.uint8)
+        OnnxWeightStore._validate_symmetric_zero_points(zero_points, spec)
+
+    def test_validate_symmetric_zero_points_accepts_default_8bit(self):
+        spec = QuantSpec(bits=8, block_size=4, k=8, n=2)
+        zero_points = np.full((spec.n, 2), 128, dtype=np.uint8)
+        OnnxWeightStore._validate_symmetric_zero_points(zero_points, spec)
+
+    def test_validate_symmetric_zero_points_rejects_asymmetric(self):
+        spec = QuantSpec(bits=8, block_size=4, k=8, n=2)
+        zero_points = np.full((spec.n, 2), 128, dtype=np.uint8)
+        zero_points[0, 0] = 127
+        with self.assertRaises(ValueError):
+            OnnxWeightStore._validate_symmetric_zero_points(zero_points, spec)
+
+    def test_assert_uniform_rope_cache_accepts_identical_layers(self):
+        cos = np.ones((16, 8), dtype=np.float16)
+        sin = np.zeros((16, 8), dtype=np.float16)
+        tensors = {}
+        for layer_idx in range(3):
+            tensors[f"model.layers.{layer_idx}.self_attn.cos_cached_export"] = cos.copy()
+            tensors[f"model.layers.{layer_idx}.self_attn.sin_cached_export"] = sin.copy()
+        ref_cos, ref_sin = assert_uniform_rope_cache(_DictStore(tensors), 3)
+        np.testing.assert_array_equal(ref_cos, cos)
+        np.testing.assert_array_equal(ref_sin, sin)
+
+    def test_assert_uniform_rope_cache_rejects_divergent_layers(self):
+        cos = np.ones((16, 8), dtype=np.float16)
+        sin = np.zeros((16, 8), dtype=np.float16)
+        tensors = {}
+        for layer_idx in range(3):
+            tensors[f"model.layers.{layer_idx}.self_attn.cos_cached_export"] = cos.copy()
+            tensors[f"model.layers.{layer_idx}.self_attn.sin_cached_export"] = sin.copy()
+        tensors["model.layers.1.self_attn.cos_cached_export"] = (cos + 1).astype(np.float16)
+        with self.assertRaises(ValueError):
+            assert_uniform_rope_cache(_DictStore(tensors), 3)
+
+    def test_tied_embedding_as_linear_matches_separate_lm_head(self):
+        """Tied output projection (embed.as_linear) must equal a separate quantized lm_head."""
+        mx.random.seed(0)
+        vocab, dim = 32, 64
+        weight = (mx.random.normal((vocab, dim)) * 0.1).astype(mx.float16)
+        embedding = nn.Embedding(vocab, dim)
+        embedding.weight = weight
+        quant_embedding = embedding.to_quantized(group_size=32, bits=4)
+        linear = nn.Linear(dim, vocab, bias=False)
+        linear.weight = weight
+        quant_linear = linear.to_quantized(group_size=32, bits=4)
+        hidden = (mx.random.normal((2, 3, dim)) * 0.1).astype(mx.float16)
+        np.testing.assert_array_equal(
+            np.array(quant_embedding.as_linear(hidden)),
+            np.array(quant_linear(hidden)),
         )
 
 
